@@ -59,6 +59,13 @@ async function startServer() {
     maxOrderSize: number;
     riskPreference: number; // 0-100
     horizon: "short" | "medium" | "long";
+    // 自动执行配置
+    intervalSeconds: number; // 执行间隔（秒），0表示禁用自动执行
+    // 执行状态追踪
+    lastRunAt: string | null;
+    lastTradeCount: number;
+    totalTrades: number;
+    lastError: string | null;
     createdAt: string;
     updatedAt: string;
   };
@@ -332,6 +339,44 @@ async function startServer() {
   let admins: string[] = kvGet<string[]>("admins", []);
   let adminTokens: Record<string, { address: string; expiresAt: string }> = kvGet("adminTokens", {});
   let bots: BotConfig[] = kvGet<BotConfig[]>("bots", []);
+
+  // --- Bot Timer Management ---
+  const botTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  // 启动单个bot的定时器
+  const startBotTimer = (bot: BotConfig) => {
+    if (!bot.enabled || bot.intervalSeconds <= 0) return;
+    stopBotTimer(bot.id); // 先停止旧的
+    const interval = Math.max(3000, bot.intervalSeconds * 1000); // 最小3秒
+    const timerId = setInterval(() => {
+      try {
+        runSingleBot(bot.id);
+      } catch (e) {
+        console.error(`Bot ${bot.name} execution error:`, e);
+      }
+    }, interval);
+    botTimers.set(bot.id, timerId);
+    console.log(`[Bot] Started ${bot.name} with interval ${bot.intervalSeconds}s`);
+  };
+
+  // 停止单个bot的定时器
+  const stopBotTimer = (botId: string) => {
+    const existing = botTimers.get(botId);
+    if (existing) {
+      clearInterval(existing);
+      botTimers.delete(botId);
+      console.log(`[Bot] Stopped timer for ${botId}`);
+    }
+  };
+
+  // 为所有启用的bot启动定时器（服务启动时调用）
+  const startAllBotTimers = () => {
+    bots.forEach(bot => {
+      if (bot.enabled && bot.intervalSeconds > 0) {
+        startBotTimer(bot);
+      }
+    });
+  };
   let datasets: DatasetRecord[] = kvGet<DatasetRecord[]>("datasets", []);
   let datasetRows: Record<string, any[]> = kvGet<Record<string, any[]>>("datasetRows", {});
   let analysisJobs: AnalysisJob[] = kvGet<AnalysisJob[]>("analysisJobs", []);
@@ -345,8 +390,8 @@ async function startServer() {
       `请审核预测市场问题是否清晰可判定，且不包含违法、极端、侵权、个人隐私等高风险内容。\n` +
       `仅输出 JSON：{"recommend":"APPROVE"|"REJECT","reasons":"...","suggestion":"..."}`,
     settlePrompt:
-      `请根据给定的结算参考信息判断事件是否发生。\n` +
-      `仅输出 YES 或 NO（大写），不得输出多余文本。`,
+      `你将基于"预测市场题目 + 联网检索证据摘要"判断事件是否发生，并输出严格 JSON（禁止包裹在代码块中）。\n` +
+      `仅输出 JSON：{"outcome":"YES"|"NO","reasons":"简要原因（引用证据编号）","sources":[{"title":"...","url":"..."}]}`,
     retrieval: {
       enabled: false,
       provider: "tavily",
@@ -355,25 +400,56 @@ async function startServer() {
     },
     crossValidate: true,
     providers: [
+      // ===== 🌟 国内免费模型（推荐，无需代理）=====
+      {
+        id: "siliconflow",
+        enabled: true,  // 默认启用，SiliconFlow 国内直连
+        model: "Qwen/Qwen2.5-7B-Instruct",
+        baseUrl: "https://api.siliconflow.cn/v1",
+        keys: process.env.SILICONFLOW_API_KEY ? [{ label: "env", apiKey: process.env.SILICONFLOW_API_KEY }] : []
+      },
       {
         id: "qwen",
         enabled: false,
         model: "qwen-plus",
         baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        keys: []
+        keys: process.env.DASHSCOPE_API_KEY ? [{ label: "env", apiKey: process.env.DASHSCOPE_API_KEY }] : []
+      },
+      {
+        id: "deepseek",
+        enabled: false,
+        model: "deepseek-chat",
+        baseUrl: "https://api.deepseek.com/v1",
+        keys: process.env.DEEPSEEK_API_KEY ? [{ label: "env", apiKey: process.env.DEEPSEEK_API_KEY }] : []
+      },
+      {
+        id: "zhipu",
+        enabled: false,
+        model: "glm-4-flash",
+        baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+        keys: process.env.ZHIPU_API_KEY ? [{ label: "env", apiKey: process.env.ZHIPU_API_KEY }] : []
+      },
+      {
+        id: "moonshot",
+        enabled: false,
+        model: "moonshot-v1-8k",
+        baseUrl: "https://api.moonshot.cn/v1",
+        keys: process.env.MOONSHOT_API_KEY ? [{ label: "env", apiKey: process.env.MOONSHOT_API_KEY }] : []
+      },
+      // ===== 国际模型（需代理）=====
+      {
+        id: "gemini",
+        enabled: false,
+        model: "gemini-2.0-flash",
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+        keys: process.env.GEMINI_API_KEY ? [{ label: "env", apiKey: process.env.GEMINI_API_KEY }] : []
       },
       {
         id: "openai",
         enabled: false,
         model: "gpt-4o-mini",
         baseUrl: "https://api.openai.com/v1",
-        keys: []
-      },
-      {
-        id: "gemini",
-        enabled: true,
-        model: "gemini-2.0-flash",
-        keys: process.env.GEMINI_API_KEY ? [{ label: "env", apiKey: process.env.GEMINI_API_KEY }] : []
+        keys: process.env.OPENAI_API_KEY ? [{ label: "env", apiKey: process.env.OPENAI_API_KEY }] : []
       }
     ]
   };
@@ -383,6 +459,37 @@ async function startServer() {
     aiSettings = defaultAISettings;
     kvSet("aiSettings", aiSettings);
   }
+
+  // 启动时：将 .env 中的各 provider Key 补注入到已有 aiSettings 里
+  // 只补入没有 Key 的 provider，不覆盖手动配置的 Key
+  const envKeyMap: Record<string, string | undefined> = {
+    siliconflow: process.env.SILICONFLOW_API_KEY,
+    gemini: process.env.GEMINI_API_KEY,
+    openai: process.env.OPENAI_API_KEY,
+    qwen: process.env.DASHSCOPE_API_KEY,
+    deepseek: process.env.DEEPSEEK_API_KEY,
+    zhipu: process.env.ZHIPU_API_KEY,
+    moonshot: process.env.MOONSHOT_API_KEY,
+  };
+  let settingsPatched = false;
+  aiSettings.providers = aiSettings.providers.map(p => {
+    const envKey = envKeyMap[p.id];
+    if (envKey) {
+      // 如果已有 env 标签的 key，更新它（env 变量可能改变）
+      const hasEnvLabel = p.keys?.some(k => k.label === "env");
+      if (hasEnvLabel) {
+        settingsPatched = true;
+        return { ...p, enabled: true, keys: [{ label: "env", apiKey: envKey }, ...p.keys.filter(k => k.label !== "env")] };
+      }
+      // 如果没有任何 key，补入 env key
+      if (!p.keys || p.keys.length === 0) {
+        settingsPatched = true;
+        return { ...p, enabled: true, keys: [{ label: "env", apiKey: envKey }] };
+      }
+    }
+    return p;
+  });
+  if (settingsPatched) kvSet("aiSettings", aiSettings);
 
   // 若数据库仍是旧题库（不包含新分类/新题目），自动迁移到新题库（保留最小惊讶：仅当明显不匹配时覆盖）
   const newCategories = new Set(["政治与政策", "经济与金融", "科技发展", "全球事件", "娱乐与文化", "体育赛事"]);
@@ -409,8 +516,64 @@ async function startServer() {
   let fabricContract: FabricContractLike | null = null;
   let fabricReady = false;
   let fabricLastError = "";
+  let fabricMockMode = false; // Mock 模式标志
+
+  // 检查是否启用 Fabric Mock 模式（当 FABRIC_ENABLED=false 或配置不完整时启用）
+  const useFabricMock = () => {
+    const enabled = process.env.FABRIC_ENABLED !== 'false';
+    const hasProfile = !!process.env.FABRIC_CONNECTION_PROFILE;
+    return !enabled || !hasProfile;
+  };
+
+  // Mock Fabric 实现：当 Fabric 不可用时，使用本地 SQLite 存储作为账本
+  const mockFabricContract: FabricContractLike = {
+    submitTransaction: async (fn: string, ...args: string[]) => {
+      const payload = args[0] || '{}';
+      const data = JSON.parse(payload);
+
+      if (fn === 'CreateTrade') {
+        // 将交易存储到 SQLite kv 表
+        const key = `fabric_trade_${data.id || Date.now()}`;
+        kvSet(key, { ...data, fabric_timestamp: new Date().toISOString() });
+        console.log(`[Fabric Mock] CreateTrade: ${data.id}`);
+      } else if (fn === 'CreateOrder') {
+        const key = `fabric_order_${data.id || Date.now()}`;
+        kvSet(key, { ...data, fabric_timestamp: new Date().toISOString() });
+        console.log(`[Fabric Mock] CreateOrder: ${data.id}`);
+      }
+
+      return new Uint8Array(Buffer.from(JSON.stringify({ ok: true })));
+    },
+    evaluateTransaction: async (fn: string, ...args: string[]) => {
+      const marketId = args[0];
+      if (fn === 'QueryTradesByMarket') {
+        // 从 SQLite kv 表查询交易
+        const allTrades: any[] = [];
+        const tradeKeys: string[] = kvGet("fabric_trade_keys", []);
+        for (const k of tradeKeys) {
+          const t = kvGet<any>(k, null);
+          if (t && t.marketId === parseInt(marketId)) {
+            allTrades.push(t);
+          }
+        }
+        return new Uint8Array(Buffer.from(JSON.stringify(allTrades)));
+      }
+      return new Uint8Array(Buffer.from(JSON.stringify([])));
+    }
+  };
+
   const initFabricGateway = async () => {
-    if (fabricReady && fabricContract) return fabricContract;
+    // 如果启用 Mock 模式，直接返回 Mock 合约
+    if (useFabricMock()) {
+      fabricMockMode = true;
+      fabricReady = true;
+      fabricContract = mockFabricContract;
+      fabricLastError = "";
+      console.log("[Fabric] 运行在 Mock 模式（使用本地 SQLite 存储）");
+      return fabricContract;
+    }
+
+    if (fabricReady && fabricContract && !fabricMockMode) return fabricContract;
     try {
       const connectionProfilePath = process.env.FABRIC_CONNECTION_PROFILE || "";
       const walletPath = process.env.FABRIC_WALLET_PATH || path.join(process.cwd(), "fabric", "wallet");
@@ -434,13 +597,19 @@ async function startServer() {
       const network = await gateway.getNetwork(channelName);
       fabricContract = network.getContract(chaincodeName) as unknown as FabricContractLike;
       fabricReady = true;
+      fabricMockMode = false;
       fabricLastError = "";
+      console.log("[Fabric] 已连接到真实 Fabric 网络");
       return fabricContract;
     } catch (e: any) {
       fabricReady = false;
       fabricContract = null;
       fabricLastError = String(e?.message || e);
-      return null;
+      fabricMockMode = true;
+      console.warn(`[Fabric] 连接失败，自动切换到 Mock 模式: ${fabricLastError}`);
+      fabricContract = mockFabricContract;
+      fabricReady = true;
+      return fabricContract;
     }
   };
 
@@ -467,6 +636,67 @@ async function startServer() {
     const out = await c.evaluateTransaction("QueryTradesByMarket", String(marketId));
     const text = Buffer.from(out).toString("utf8");
     return JSON.parse(text || "[]");
+  };
+
+  // 将市场数据同步上链
+  const fabricCreateMarket = async (market: Market) => {
+    const c = await initFabricGateway();
+    if (!c) return; // Mock 模式下直接跳过
+    try {
+      const payload = JSON.stringify({
+        id: market.id,
+        question: market.question,
+        category: market.category,
+        endTime: market.endTime,
+        yesPrice: market.yesPrice,
+        noPrice: market.noPrice,
+        status: market.status,
+        createdAt: market.createdAt
+      });
+      await c.submitTransaction("CreateMarket", payload);
+    } catch (e: any) {
+      // 如果是 Mock 模式或链码未部署，静默忽略
+      if (!fabricMockMode) {
+        console.warn("[Fabric] CreateMarket 失败:", e?.message);
+      }
+    }
+  };
+
+  // 结算市场 - 同步上链
+  const fabricResolveMarket = async (marketId: number, outcome: boolean) => {
+    const c = await initFabricGateway();
+    if (!c) return;
+    try {
+      await c.submitTransaction("ResolveMarket", String(marketId), outcome ? "YES" : "NO");
+    } catch (e: any) {
+      if (!fabricMockMode) {
+        console.warn("[Fabric] ResolveMarket 失败:", e?.message);
+      }
+    }
+  };
+
+  // 查询账本统计
+  const fabricGetLedgerStats = async () => {
+    const c = await initFabricGateway();
+    if (!c) return null;
+    try {
+      const out = await c.evaluateTransaction("GetLedgerStats");
+      return JSON.parse(Buffer.from(out).toString("utf8"));
+    } catch {
+      return null;
+    }
+  };
+
+  // 查询所有上链市场
+  const fabricGetAllMarkets = async () => {
+    const c = await initFabricGateway();
+    if (!c) return [];
+    try {
+      const out = await c.evaluateTransaction("GetAllMarkets");
+      return JSON.parse(Buffer.from(out).toString("utf8") || "[]");
+    } catch {
+      return [];
+    }
   };
 
   // 注入演示成交与市场统计（用于分析看板可用性展示）
@@ -623,35 +853,69 @@ async function startServer() {
     kvSet("markets", markets);
   };
 
-  const runBotsOnce = () => {
-    const activeBots = bots.filter(b => b.enabled);
-    if (activeBots.length === 0) return;
-    activeBots.forEach(bot => {
-      const marketPool = bot.marketIds.length > 0
-        ? markets.filter(m => bot.marketIds.includes(m.id) && m.status === MarketStatus.OPEN)
-        : markets.filter(m => m.status === MarketStatus.OPEN);
-      if (marketPool.length === 0) return;
-      const m = marketPool[Math.floor(Math.random() * marketPool.length)];
-      const baseCount = Math.max(1, Math.floor(bot.intensity));
-      const horizonMul = bot.horizon === "short" ? 1.6 : bot.horizon === "long" ? 0.8 : 1.1;
-      const riskMul = 0.6 + (bot.riskPreference / 100) * 1.4; // 0.6 ~ 2.0
-      const simulateCount = Math.min(40, Math.max(1, Math.round(baseCount * 2 * horizonMul * riskMul)));
-      appendSimulatedTrades(simulateCount);
-      // 小幅漂移，避免静态价格
-      const driftRange = 1 + Math.round((bot.riskPreference / 100) * 4); // 1~5
-      m.yesPrice = Math.max(1, Math.min(99, Math.round(m.yesPrice + (Math.random() * (driftRange * 2) - driftRange))));
-      m.noPrice = 100 - m.yesPrice;
-    });
+  // 执行单个bot的逻辑
+  const runSingleBot = (botId: string): number => {
+    const bot = bots.find(b => b.id === botId);
+    if (!bot || !bot.enabled) return 0;
+
+    const marketPool = bot.marketIds.length > 0
+      ? markets.filter(m => bot.marketIds.includes(m.id) && m.status === MarketStatus.OPEN)
+      : markets.filter(m => m.status === MarketStatus.OPEN);
+    if (marketPool.length === 0) return 0;
+
+    const prevTradeCount = trades.length;
+    const m = marketPool[Math.floor(Math.random() * marketPool.length)];
+    const baseCount = Math.max(1, Math.floor(bot.intensity));
+    const horizonMul = bot.horizon === "short" ? 1.6 : bot.horizon === "long" ? 0.8 : 1.1;
+    const riskMul = 0.6 + (bot.riskPreference / 100) * 1.4; // 0.6 ~ 2.0
+    const simulateCount = Math.min(40, Math.max(1, Math.round(baseCount * 2 * horizonMul * riskMul)));
+    appendSimulatedTrades(simulateCount);
+    // 小幅漂移，避免静态价格
+    const driftRange = 1 + Math.round((bot.riskPreference / 100) * 4); // 1~5
+    m.yesPrice = Math.max(1, Math.min(99, Math.round(m.yesPrice + (Math.random() * (driftRange * 2) - driftRange))));
+    m.noPrice = 100 - m.yesPrice;
+
+    // 更新bot执行状态
+    const tradeCount = trades.length - prevTradeCount;
+    bot.lastRunAt = new Date().toISOString();
+    bot.lastTradeCount = tradeCount;
+    bot.totalTrades = (bot.totalTrades || 0) + tradeCount;
+    bot.lastError = null;
+    kvSet("bots", bots);
     persistAll();
+
+    return tradeCount;
   };
 
+  // 手动触发所有活跃bot执行一次
+  const runBotsOnce = (): number => {
+    const activeBots = bots.filter(b => b.enabled);
+    if (activeBots.length === 0) return 0;
+    let totalTrades = 0;
+    activeBots.forEach(bot => {
+      totalTrades += runSingleBot(bot.id);
+    });
+    return totalTrades;
+  };
+
+  // 全局定时器（保留用于触发手动模式的bot）
   setInterval(() => {
     try {
-      runBotsOnce();
+      // 仅在无独立定时器的bot存在时执行
+      const hasAutoBots = bots.some(b => b.enabled && b.intervalSeconds > 0);
+      if (!hasAutoBots) {
+        runBotsOnce();
+      }
     } catch (e) {
       console.error("runBotsOnce interval error:", e);
     }
   }, 5000);
+
+  // 服务启动时，为所有启用的bot启动独立定时器
+  setTimeout(() => {
+    startAllBotTimers();
+    console.log(`[Bot] Initialized ${botTimers.size} bot timers`);
+  }, 1000);
 
   const buildOhlcv = (marketId: number, tfMinutes: number, limit: number) => {
     const marketTrades = trades
@@ -851,9 +1115,35 @@ async function startServer() {
   };
 
   const callGemini = async (opts: { apiKey: string; model: string; prompt: string }) => {
-    const ai = new GoogleGenAI({ apiKey: opts.apiKey });
-    const result = await ai.models.generateContent({ model: opts.model, contents: opts.prompt });
-    return (result.text || "").trim();
+    // 改用 OpenAI 兼容端点，不依赖 GoogleGenAI SDK，避免代理问题
+    return callOpenAICompatible({
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+      apiKey: opts.apiKey,
+      model: opts.model,
+      system: "你是预测市场平台的审核与结算助手。你必须输出严格 JSON（不包裹 Markdown），不得输出多余文本。",
+      user: opts.prompt,
+      timeoutMs: 20000
+    });
+  };
+
+  /**
+   * 鲁棒 JSON 提取：处理 Gemini/LLM 包裹在 ```json ``` 代码块里的情况
+   */
+  const extractJSON = (raw: string): any => {
+    // 1) 尝试直接解析
+    try { return JSON.parse(raw); } catch {}
+    // 2) 剥掉 ```json ... ``` 或 ``` ... ```
+    const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence) {
+      try { return JSON.parse(fence[1].trim()); } catch {}
+    }
+    // 3) 找第一个 { ... } 块
+    const braceStart = raw.indexOf('{');
+    const braceEnd = raw.lastIndexOf('}');
+    if (braceStart !== -1 && braceEnd > braceStart) {
+      try { return JSON.parse(raw.slice(braceStart, braceEnd + 1)); } catch {}
+    }
+    return null;
   };
 
   const runMarketReviewWithProviders = async (market: Market, extraContext: string | undefined) => {
@@ -874,18 +1164,14 @@ async function startServer() {
       const apiKey = pickKey(p);
       if (!apiKey) return { provider: p.id, ok: false, raw: "no key" };
       try {
-        let raw = "";
-        if (p.id === "gemini") {
-          raw = await callGemini({ apiKey, model: p.model, prompt: `${aiSettings.systemPrompt}\n\n${userPrompt}` });
-        } else {
-          raw = await callOpenAICompatible({
-            baseUrl: p.baseUrl || (p.id === "openai" ? "https://api.openai.com/v1" : "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            apiKey,
-            model: p.model,
-            system: aiSettings.systemPrompt,
-            user: userPrompt
-          });
-        }
+        const raw = await callOpenAICompatible({
+          baseUrl: p.baseUrl || "https://api.openai.com/v1",
+          apiKey,
+          model: p.model,
+          system: aiSettings.systemPrompt,
+          user: userPrompt,
+          timeoutMs: 25000
+        });
         return { provider: p.id, ok: true, raw };
       } catch (e: any) {
         return { provider: p.id, ok: false, raw: String(e?.message || e) };
@@ -896,17 +1182,20 @@ async function startServer() {
     const parsed = results
       .filter(r => r.ok)
       .map(r => {
-        try {
-          const obj = JSON.parse(r.raw);
-          return { provider: r.provider, recommend: obj?.recommend, reasons: obj?.reasons, suggestion: obj?.suggestion, raw: r.raw };
-        } catch {
-          return { provider: r.provider, recommend: null, reasons: null, suggestion: null, raw: r.raw };
-        }
+        const obj = extractJSON(r.raw);
+        return {
+          provider: r.provider,
+          recommend: obj?.recommend ?? null,
+          reasons: obj?.reasons ?? null,
+          suggestion: obj?.suggestion ?? null,
+          raw: r.raw
+        };
       });
 
     if (!aiSettings.crossValidate) {
       const first = parsed[0];
-      return { results, final: first || null };
+      if (!first) return { error: "AI 未返回有效结果", results };
+      return { results, final: first };
     }
 
     const votes = { APPROVE: 0, REJECT: 0 };
@@ -920,12 +1209,14 @@ async function startServer() {
       .map(p => `【${p.provider}】${p.reasons}`)
       .join("\n");
     const finalSuggestion = parsed.find(p => p.suggestion)?.suggestion || "";
+    // 如果解析全都失败，把 raw 原文展示
+    const fallbackRaw = parsed.filter(p => p.raw).map(p => `【${p.provider} raw】${p.raw}`).join("\n");
 
     return {
       results,
       final: {
         recommend: finalRecommend,
-        reasons: finalReasons || "（未能解析到结构化 reasons，详见 raw）",
+        reasons: finalReasons || fallbackRaw || "AI 未能给出原因",
         suggestion: finalSuggestion
       },
       votes
@@ -1019,18 +1310,14 @@ async function startServer() {
       const apiKey = pickKey(p);
       if (!apiKey) return { provider: p.id, ok: false, raw: "no key" };
       try {
-        let raw = "";
-        if (p.id === "gemini") {
-          raw = await callGemini({ apiKey, model: p.model, prompt: `${aiSettings.systemPrompt}\n\n${userPrompt}` });
-        } else {
-          raw = await callOpenAICompatible({
-            baseUrl: p.baseUrl || (p.id === "openai" ? "https://api.openai.com/v1" : "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            apiKey,
-            model: p.model,
-            system: aiSettings.systemPrompt,
-            user: userPrompt
-          });
-        }
+        const raw = await callOpenAICompatible({
+          baseUrl: p.baseUrl || "https://api.openai.com/v1",
+          apiKey,
+          model: p.model,
+          system: aiSettings.systemPrompt,
+          user: userPrompt,
+          timeoutMs: 25000
+        });
         return { provider: p.id, ok: true, raw };
       } catch (e: any) {
         return { provider: p.id, ok: false, raw: String(e?.message || e) };
@@ -1041,12 +1328,14 @@ async function startServer() {
     const parsed = results
       .filter(r => r.ok)
       .map(r => {
-        try {
-          const obj = JSON.parse(r.raw);
-          return { provider: r.provider, outcome: obj?.outcome, reasons: obj?.reasons, sources: obj?.sources, raw: r.raw };
-        } catch {
-          return { provider: r.provider, outcome: null, reasons: null, sources: null, raw: r.raw };
-        }
+        const obj = extractJSON(r.raw);
+        return {
+          provider: r.provider,
+          outcome: obj?.outcome ?? null,
+          reasons: obj?.reasons ?? null,
+          sources: obj?.sources ?? null,
+          raw: r.raw
+        };
       });
 
     const vote = { YES: 0, NO: 0 };
@@ -1059,6 +1348,8 @@ async function startServer() {
       .filter(p => p.outcome === finalOutcome && p.reasons)
       .map(p => `【${p.provider}】${p.reasons}`)
       .join("\n");
+    // 解析全部失败时降级展示原始内容
+    const fallbackRaw = parsed.filter(p => p.raw && p.raw !== "no key").map(p => `【${p.provider}】${p.raw.slice(0, 300)}`).join("\n");
 
     const flatSources =
       (parsed.find(p => Array.isArray(p.sources))?.sources || []).slice(0, 5);
@@ -1068,7 +1359,7 @@ async function startServer() {
       sources: searchResults,
       ai: {
         outcome: finalOutcome,
-        reasons: finalReasons || "（未能解析到结构化 reasons，详见 raw）",
+        reasons: finalReasons || fallbackRaw || "AI 未能给出原因",
         sources: flatSources
       }
     };
@@ -1294,6 +1585,8 @@ async function startServer() {
 
     markets.push(market);
     persistAll();
+    // 异步同步上链（不阻塞 HTTP 响应）
+    fabricCreateMarket(market).catch(() => {});
     res.json(market);
   });
 
@@ -1581,12 +1874,20 @@ async function startServer() {
 
   app.get("/api/ledger/status", async (req, res) => {
     const c = await initFabricGateway();
+    // 附加链上统计（真实网络时）
+    let onChainStats = null;
+    if (c && !fabricMockMode) {
+      onChainStats = await fabricGetLedgerStats().catch(() => null);
+    }
     res.json({
       ready: !!c,
+      mockMode: fabricMockMode,
       channel: process.env.FABRIC_CHANNEL || "mychannel",
       chaincode: process.env.FABRIC_CHAINCODE || "predictionmarket",
       identity: process.env.FABRIC_IDENTITY || "appUser",
-      error: c ? "" : fabricLastError
+      fabricEnabled: process.env.FABRIC_ENABLED !== 'false',
+      error: c && !fabricMockMode ? fabricLastError : "",
+      onChainStats
     });
   });
 
@@ -1724,6 +2025,7 @@ async function startServer() {
     return requireAdminToken(req as any, res as any, () => {
       const body = req.body || {};
       const now = new Date().toISOString();
+      const intervalSeconds = Math.max(0, Math.min(3600, Number(body.intervalSeconds) || 0));
       const bot: BotConfig = {
         id: crypto.randomBytes(8).toString("hex"),
         name: String(body.name || `Bot-${bots.length + 1}`),
@@ -1734,11 +2036,20 @@ async function startServer() {
         maxOrderSize: Math.max(10, Math.min(1000, Number(body.maxOrderSize) || 200)),
         riskPreference: Math.max(0, Math.min(100, Number(body.riskPreference) || 50)),
         horizon: body.horizon === "short" || body.horizon === "long" ? body.horizon : "medium",
+        intervalSeconds,
+        lastRunAt: null,
+        lastTradeCount: 0,
+        totalTrades: 0,
+        lastError: null,
         createdAt: now,
         updatedAt: now
       };
       bots.push(bot);
       kvSet("bots", bots);
+      // 启动定时器
+      if (bot.enabled && bot.intervalSeconds > 0) {
+        startBotTimer(bot);
+      }
       res.json(bot);
     });
   });
@@ -1748,6 +2059,8 @@ async function startServer() {
       const bot = bots.find(b => b.id === req.params.id);
       if (!bot) return res.status(404).json({ error: "机器人不存在" });
       const body = req.body || {};
+      const prevEnabled = bot.enabled;
+      const prevInterval = bot.intervalSeconds;
       if (typeof body.name === "string") bot.name = body.name;
       if (typeof body.enabled === "boolean") bot.enabled = body.enabled;
       if (body.strategy === "market_maker" || body.strategy === "momentum" || body.strategy === "noise") bot.strategy = body.strategy;
@@ -1756,8 +2069,17 @@ async function startServer() {
       if (typeof body.maxOrderSize === "number") bot.maxOrderSize = Math.max(10, Math.min(1000, body.maxOrderSize));
       if (typeof body.riskPreference === "number") bot.riskPreference = Math.max(0, Math.min(100, body.riskPreference));
       if (body.horizon === "short" || body.horizon === "medium" || body.horizon === "long") bot.horizon = body.horizon;
+      if (typeof body.intervalSeconds === "number") bot.intervalSeconds = Math.max(0, Math.min(3600, body.intervalSeconds));
       bot.updatedAt = new Date().toISOString();
       kvSet("bots", bots);
+      // 管理定时器
+      const shouldRun = bot.enabled && bot.intervalSeconds > 0;
+      const wasRunning = prevEnabled && prevInterval > 0;
+      if (shouldRun && (!wasRunning || prevInterval !== bot.intervalSeconds)) {
+        startBotTimer(bot);
+      } else if (!shouldRun && wasRunning) {
+        stopBotTimer(bot.id);
+      }
       res.json(bot);
     });
   });
@@ -1769,6 +2091,10 @@ async function startServer() {
       bot.enabled = true;
       bot.updatedAt = new Date().toISOString();
       kvSet("bots", bots);
+      // 启动定时器
+      if (bot.intervalSeconds > 0) {
+        startBotTimer(bot);
+      }
       res.json({ ok: true, bot });
     });
   });
@@ -1780,14 +2106,42 @@ async function startServer() {
       bot.enabled = false;
       bot.updatedAt = new Date().toISOString();
       kvSet("bots", bots);
+      stopBotTimer(bot.id); // 停止定时器
       res.json({ ok: true, bot });
+    });
+  });
+
+  app.delete("/api/admin/bots/:id", (req, res) => {
+    return requireAdminToken(req as any, res as any, () => {
+      const idx = bots.findIndex(b => b.id === req.params.id);
+      if (idx === -1) return res.status(404).json({ error: "机器人不存在" });
+      const [removed] = bots.splice(idx, 1);
+      kvSet("bots", bots);
+      stopBotTimer(removed.id); // 清理定时器
+      res.json({ ok: true, removed });
     });
   });
 
   app.post("/api/admin/bots/run-once", (req, res) => {
     return requireAdminToken(req as any, res as any, () => {
-      runBotsOnce();
-      res.json({ ok: true, tradesCount: trades.length });
+      const prevCount = trades.length;
+      const botResults: Record<string, { trades: number; error: string | null }> = {};
+      bots.filter(b => b.enabled).forEach(bot => {
+        try {
+          botResults[bot.name] = { trades: runSingleBot(bot.id), error: null };
+        } catch (e) {
+          botResults[bot.name] = { trades: 0, error: String(e) };
+        }
+      });
+      persistAll();
+      res.json({
+        ok: true,
+        totalTrades: trades.length - prevCount,
+        tradesCount: trades.length,
+        botsCount: Object.keys(botResults).length,
+        results: botResults,
+        timestamp: new Date().toISOString()
+      });
     });
   });
 
@@ -1944,13 +2298,27 @@ async function startServer() {
 
       if (Array.isArray(body.providers)) {
         // 简单校验 + 合并
-        aiSettings.providers = body.providers.map((p: any) => ({
-          id: p.id,
-          enabled: !!p.enabled,
-          model: String(p.model || ""),
-          baseUrl: p.baseUrl ? String(p.baseUrl) : undefined,
-          keys: Array.isArray(p.keys) ? p.keys.filter((k: any) => k?.apiKey).map((k: any) => ({ label: k.label, apiKey: String(k.apiKey) })) : []
-        }));
+        // 若环境变量有 Key 且 provider 没有手动配置 key，自动补充（防止前端误覆盖）
+        const envKeyMap: Record<string, string> = {
+          gemini: process.env.GEMINI_API_KEY || "",
+          openai: process.env.OPENAI_API_KEY || "",
+          qwen: process.env.DASHSCOPE_API_KEY || "",
+        };
+        aiSettings.providers = body.providers.map((p: any) => {
+          const hasEnvKey = !!envKeyMap[p.id];
+          const currentKeys = Array.isArray(p.keys) ? p.keys.filter((k: any) => k?.apiKey) : [];
+          // 若 provider 没配置任何 key 但环境变量有，自动从 env 补充
+          if (currentKeys.length === 0 && hasEnvKey) {
+            currentKeys.push({ label: "env", apiKey: envKeyMap[p.id] });
+          }
+          return {
+            id: p.id,
+            enabled: !!p.enabled,
+            model: String(p.model || ""),
+            baseUrl: p.baseUrl ? String(p.baseUrl) : undefined,
+            keys: currentKeys.map((k: any) => ({ label: k.label, apiKey: String(k.apiKey) }))
+          };
+        });
       }
 
       kvSet("aiSettings", aiSettings);
@@ -2169,6 +2537,67 @@ async function startServer() {
     });
   });
 
+  // 管理员：批量导入真实预测市场题目
+  app.post("/api/admin/markets/import", (req, res) => {
+    return requireAdminToken(req as any, res as any, () => {
+      const { markets: newMarkets, replace = false } = req.body || {};
+      if (!Array.isArray(newMarkets) || newMarkets.length === 0) {
+        return res.status(400).json({ error: "需要提供 markets 数组" });
+      }
+
+      // 如果 replace=true，先删除所有现有市场
+      if (replace) {
+        markets = [];
+      }
+
+      // 找出最大ID
+      const maxId = markets.length > 0 ? Math.max(...markets.map(m => m.id)) : 0;
+
+      // 导入新市场
+      const now = new Date().toISOString();
+      const added = newMarkets.map((m: any, index: number) => {
+        const market: Market = {
+          id: replace ? (index + 1) : (maxId + index + 1),
+          title: String(m.title || "").trim(),
+          description: String(m.description || "").trim(),
+          category: String(m.category || "其他").trim(),
+          status: m.status === "RESOLVED" ? MarketStatus.RESOLVED :
+                  m.status === "CLOSED" ? MarketStatus.CLOSED :
+                  m.status === "PENDING" ? MarketStatus.PENDING : MarketStatus.OPEN,
+          yesPrice: Math.max(0, Math.min(99, Number(m.yesPrice) || 50)),
+          noPrice: Math.max(0, Math.min(99, Number(m.noPrice) || 50)),
+          volume: Math.max(0, Number(m.volume) || 0),
+          participants: Math.max(0, Number(m.participants) || 0),
+          liquidity: Math.max(100, Number(m.liquidity) || 1000),
+          resolvedOutcome: m.resolvedOutcome || null,
+          resolvedAt: m.resolvedAt || null,
+          endTime: m.endTime || "2026-12-31T23:59:59Z",
+          resolutionSource: String(m.resolutionSource || "官方公告").trim(),
+          createdAt: m.createdAt || now,
+          updatedAt: now
+        };
+        return market;
+      });
+
+      // 删除包含"某"字的旧虚假题目
+      const beforeCount = markets.length;
+      markets = markets.filter(m => !m.title.includes("某") && !m.title.includes("XX") && !m.title.includes("○○"));
+      const removedCount = beforeCount - markets.length;
+
+      // 添加新市场
+      markets.push(...added);
+      kvSet("markets", markets);
+
+      res.json({
+        ok: true,
+        added: added.length,
+        removed: removedCount,
+        total: markets.length,
+        markets: added.map(m => ({ id: m.id, title: m.title, category: m.category }))
+      });
+    });
+  });
+
   // 管理员：人工审核通过/拒绝市场
   app.post("/api/admin/markets/review", (req, res) => {
     const { marketId, approve } = req.body;
@@ -2261,6 +2690,9 @@ async function startServer() {
     market.resolvedOutcome = outcome;
     market.resolvedAt = new Date().toISOString();
     if (evidence) (market as any).resolvedEvidence = evidence;
+
+    // 异步同步上链结算记录
+    fabricResolveMarket(market.id, outcome === OutcomeType.YES).catch(() => {});
 
     // 规则：获胜方向每份价值 1 PMT，失败方向价值 0。
     positions

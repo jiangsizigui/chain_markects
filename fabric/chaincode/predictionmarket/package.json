@@ -1,9 +1,17 @@
 {
   "name": "predictionmarket-chaincode",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "Hyperledger Fabric 预测市场链码",
   "main": "index.js",
   "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
-    "fabric-contract-api": "^2.5.8"
+    "fabric-contract-api": "^2.5.8",
+    "fabric-shim": "^2.5.8"
   }
 }
